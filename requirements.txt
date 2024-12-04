@@ -3,3 +3,5 @@ tqdm
 numpy
 pandas
 pyarrow
+mlx ; platform_system == "Darwin"
+cupy ; platform_system == "Linux"

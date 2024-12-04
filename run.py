@@ -21,7 +21,6 @@ select * from "results.parquet" limit 10 ;
 """
 
 import cv2
-import numpy as np
 import time
 import glob
 import pandas as pd
@@ -35,57 +34,50 @@ from itertools import product
 
 INTERACTIVE=False
 SCORE_MEANSQUAREERROR=True
-USE_MX=False
+USE_GPU=False
 
-if USE_MX:
+if USE_GPU:
     if not SCORE_MEANSQUAREERROR:
         print("warning - gpu compute does not support normalized cross correlation")
         SCORE_MEANSQUAREERROR=True
 
     if INTERACTIVE:
         print("warning - cannot use gpu compute with interactive mode")
-        USE_MX=False
+        USE_GPU=False
 
-if USE_MX:
+if USE_GPU:
     try:
-        import mlx.core as mx
+        import mlx.core as np
     except:
-        mx=np
+        try:
+            import cupy as np
+        except:
+            import numpy as np
 
     DTYPE=np.float32
 else:
+    import numpy as np
     DTYPE=np.uint8
 
 def read_image(path:str)->np.array:
     ret=cv2.imread(path, cv2.IMREAD_GRAYSCALE)
 
-    if USE_MX:
-        return mx.array(ret,dtype=DTYPE)
-    else:
-        return np.array(ret,dtype=DTYPE)
+    return np.array(ret,dtype=DTYPE)
 
 def calculate_score(img1:cv2.Mat, img2:cv2.Mat)->float:
     if not SCORE_MEANSQUAREERROR:
         # normalization cross-correlation (1 at best fit case)
-        if USE_MX:
-            # run with metal on gpu
-            ret=mx.sum(img1 * img2) / mx.sqrt(mx.sum(img1 ** 2) * mx.sum(img2 ** 2))
-            ret=float(ret)
-            #print(f"{ret=}")
-            return ret
-        else:
-            # run with numpy on cpu
-            ret=np.sum(img1 * img2) / np.sqrt(np.sum(img1 ** 2) * np.sum(img2 ** 2))
-            ret=float(ret)
-            #print(f"{ret=}")
-            return ret
+
+        ret=np.sum(img1 * img2) / np.sqrt(np.sum(img1 ** 2) * np.sum(img2 ** 2))
+        ret=float(ret)
+        #print(f"{ret=}")
+        return ret
+
     else:
         # mean square error (0 at best fit case)
-        if USE_MX:
-            ret=mx.sum((img1-img2)**2)
-            return float(ret)
-        else:
-            return np.sum((img1-img2)**2)
+
+        ret=np.sum((img1-img2)**2)
+        return float(ret)
 
 def get_acq_id(p:str):
     segments=p.split("_")
@@ -138,14 +130,10 @@ def crop_images(img1, img2, x, y):
     if 1:
         # center crop
         # -> constant image size for (practically) all offsets
-        if USE_MX:
-            img2_rolled=mx.roll(mx.roll(img2, x, axis=1), y, axis=0)
-            img1_cropped = img1[750:-750,750:-750]
-            img2_cropped = img2_rolled[750:-750,750:-750]
-        else:
-            img2_rolled=np.roll(np.roll(img2, x, axis=1), y, axis=0)
-            img1_cropped = img1[750:-750,750:-750]
-            img2_cropped = img2_rolled[750:-750,750:-750]
+
+        img2_rolled=np.roll(np.roll(img2, x, axis=1), y, axis=0)
+        img1_cropped = img1[750:-750,750:-750]
+        img2_cropped = img2_rolled[750:-750,750:-750]
 
     else:
         # crop to overlap
