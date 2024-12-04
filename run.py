@@ -64,6 +64,7 @@ plates=[
     #P106069
 ]
 
+
 def automatic_find_offsets(out_file_path:str="results.parquet"):
     @dataclass
     class Result:
@@ -73,15 +74,17 @@ def automatic_find_offsets(out_file_path:str="results.parquet"):
         score:float
         dx:int
         dy:int
+        time_s:float
 
     results:list[Result]=[]
     try:
         for i in tqdm(range(len(plates))):
             for well in tqdm("D10 A05 O22 A22 D22 O05".split(" ")):
-                print(f"checking {plates[i]} : {well=}")
+                start_time=time.time()
+
                 img_paths=glob.glob(f"/Users/pathe605/Downloads/img_{plates[i]}_acqid_*_{well}_site_1_merged.png")
                 if len(img_paths)!=2:
-                    print(f"skipping, beccause: {img_paths}")
+                    print(f"skipping, because: len({img_paths})!=2")
                     continue
                         
                 img_paths=sorted(img_paths,key=lambda p:get_acq_id(p))
@@ -190,26 +193,27 @@ def automatic_find_offsets(out_file_path:str="results.parquet"):
 
                 print(f"min score: {best_score}, {dx=} {dy=} (plate {plates[i]}, {well=})")
 
-                results.append(Result(plate=plates[i],well=well,site=1,score=best_score,dx=dx,dy=dy))
+                results.append(Result(plate=plates[i],well=well,site=1,score=best_score,dx=dx,dy=dy,time_s=time.time()-start_time))
 
     finally:
         res_df=pd.DataFrame.from_records([asdict(r) for r in results])
         print(res_df.to_string())
 
         if Path(out_file_path).exists():
+            out_file_path=out_file_path[:-len(".parquet")]
             ending_num=2
             last_num=None
 
-            while Path(out_file_path+f".{ending_num}").exists():
-                if len(out_file_path.split("."))>0:
+            while Path(out_file_path+f".{ending_num}.parquet").exists():
+                if len(out_file_path.split("."))>=2:
                     try:
-                        ending_num=int(list(out_file_path.split("."))[-1])
+                        ending_num=int(list(out_file_path.split("."))[-2])
                     except:
                         pass
                     finally:
                         ending_num+=1
 
-            out_file_path+=f".{ending_num}"
+            out_file_path+=f".{ending_num}.parquet"
 
         print(f"writing to {out_file_path}")
         res_df.to_parquet(out_file_path)
