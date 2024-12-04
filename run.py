@@ -33,11 +33,59 @@ from tqdm import tqdm
 from concurrent.futures import ThreadPoolExecutor
 from itertools import product
 
+INTERACTIVE=False
+SCORE_MEANSQUAREERROR=True
+USE_MX=False
+
+if USE_MX:
+    if not SCORE_MEANSQUAREERROR:
+        print("warning - gpu compute does not support normalized cross correlation")
+        SCORE_MEANSQUAREERROR=True
+
+    if INTERACTIVE:
+        print("warning - cannot use gpu compute with interactive mode")
+        USE_MX=False
+
+if USE_MX:
+    try:
+        import mlx.core as mx
+    except:
+        mx=np
+
+    DTYPE=np.float32
+else:
+    DTYPE=np.uint8
+
+def read_image(path:str)->np.array:
+    ret=cv2.imread(path, cv2.IMREAD_GRAYSCALE)
+
+    if USE_MX:
+        return mx.array(ret,dtype=DTYPE)
+    else:
+        return np.array(ret,dtype=DTYPE)
+
 def calculate_score(img1:cv2.Mat, img2:cv2.Mat)->float:
-    # normalization cross-correlation (1 at best fit case)
-    return np.sum(img1 * img2) / np.sqrt(np.sum(img1 ** 2) * np.sum(img2 ** 2))
-    # mean square error (0 at best fit case)
-    #return np.sum((img1-img2)**2)
+    if not SCORE_MEANSQUAREERROR:
+        # normalization cross-correlation (1 at best fit case)
+        if USE_MX:
+            # run with metal on gpu
+            ret=mx.sum(img1 * img2) / mx.sqrt(mx.sum(img1 ** 2) * mx.sum(img2 ** 2))
+            ret=float(ret)
+            #print(f"{ret=}")
+            return ret
+        else:
+            # run with numpy on cpu
+            ret=np.sum(img1 * img2) / np.sqrt(np.sum(img1 ** 2) * np.sum(img2 ** 2))
+            ret=float(ret)
+            #print(f"{ret=}")
+            return ret
+    else:
+        # mean square error (0 at best fit case)
+        if USE_MX:
+            ret=mx.sum((img1-img2)**2)
+            return float(ret)
+        else:
+            return np.sum((img1-img2)**2)
 
 def get_acq_id(p:str):
     segments=p.split("_")
@@ -64,6 +112,48 @@ plates=[
     #P106069
 ]
 
+def crop_images(img1, img2, x, y):
+    """
+    Crop overlapping regions of img1 and img2 based on offsets x and y.
+
+    Args:
+        img1 (np.ndarray): The first image.
+        img2 (np.ndarray): The second image.
+        x (int): Horizontal offset (positive x crops from the left).
+        y (int): Vertical offset (positive y crops from the top).
+
+    Returns:
+        np.ndarray, np.ndarray: Cropped versions of img1 and img2 with the same overlapping region.
+    """
+    global USE_MX
+
+    h, w = img1.shape
+
+    # Calculate cropping indices
+    row_start = max(0, y)
+    row_end = h - max(0, -y)
+    col_start = max(0, x)
+    col_end = w - max(0, -x)
+
+    if 1:
+        # center crop
+        # -> constant image size for (practically) all offsets
+        if USE_MX:
+            img2_rolled=mx.roll(mx.roll(img2, x, axis=1), y, axis=0)
+            img1_cropped = img1[750:-750,750:-750]
+            img2_cropped = img2_rolled[750:-750,750:-750]
+        else:
+            img2_rolled=np.roll(np.roll(img2, x, axis=1), y, axis=0)
+            img1_cropped = img1[750:-750,750:-750]
+            img2_cropped = img2_rolled[750:-750,750:-750]
+
+    else:
+        # crop to overlap
+        # -> changing image size
+        img1_cropped = img1[row_start:row_end, col_start:col_end]
+        img2_cropped = img2[row_start:row_end, col_start:col_end]
+
+    return img1_cropped, img2_cropped
 
 def automatic_find_offsets(out_file_path:str="results.parquet"):
     @dataclass
@@ -90,8 +180,8 @@ def automatic_find_offsets(out_file_path:str="results.parquet"):
                 img_paths=sorted(img_paths,key=lambda p:get_acq_id(p))
 
                 print(img_paths)
-                img1 = cv2.imread(img_paths[0], cv2.IMREAD_GRAYSCALE)
-                img2 = cv2.imread(img_paths[1], cv2.IMREAD_GRAYSCALE)
+                img1 = read_image(img_paths[0])
+                img2 = read_image(img_paths[1])
 
                 def calculate_offset2d(img1,img2):
                     IMG_SIZE_X=img1.shape[0]
@@ -99,8 +189,8 @@ def automatic_find_offsets(out_file_path:str="results.parquet"):
 
                     def estimate_offset2d(
                         img1,img2,
-                        bounds_x:tuple[int,int],
-                        bounds_y:tuple[int,int],
+                        bounds_x:tuple[int,int]|list[int],
+                        bounds_y:tuple[int,int]|list[int],
 
                         solutions:dict[tuple[int,int],float]|None=None,
                     ):
@@ -115,9 +205,7 @@ def automatic_find_offsets(out_file_path:str="results.parquet"):
                             new_score=solutions.get((x,y))                        
                                                 
                             if new_score is None:
-                                img2_shifted = np.roll(np.roll(img2, x, axis=1), y, axis=0)
-
-                                new_score=calculate_score(img1,img2_shifted)
+                                new_score=calculate_score(*crop_images(img1, img2, x, y))
 
                                 solutions[(x,y)]=new_score
 
@@ -125,15 +213,20 @@ def automatic_find_offsets(out_file_path:str="results.parquet"):
                         min_x,min_y=0,0
 
                         # Create the grid of all x, y combinations
-                        grid = list(product(range(*bounds_x), range(*bounds_y)))
+                        if type(bounds_x)==type((2,)):
+                            bounds_x=list(range(bounds_x[0],bounds_x[-1]+1))
+                        if type(bounds_y)==type((2,)):
+                            bounds_y=list(range(bounds_y[0],bounds_y[-1]+1))
+
+                        grid = list(product(bounds_x, bounds_y))
 
                         # calculate results in parallel, using tqdm(executor.map()) for a dynamic progress bar
                         # and list(tqdm()) to force tqdm to iterate over the results
-                        with ThreadPoolExecutor() as executor:
+                        with ThreadPoolExecutor(max_workers=1) as executor:
                             list(tqdm(executor.map(lambda args: calculate_shifted_score(*args), grid),total=len(grid)))
 
-                        for x in range(*bounds_x):
-                            for y in range(*bounds_y):
+                        for x in bounds_x:
+                            for y in bounds_y:
                                 new_score=solutions.get((x,y))
                                 assert new_score is not None, f"score for {(x,y)=} is None"
 
@@ -146,46 +239,49 @@ def automatic_find_offsets(out_file_path:str="results.parquet"):
                     dx=0
                     dy=0
                     best_score=1e9 # some arbitrary large number
+                    last_score=best_score-1
 
                     solutions:dict[tuple[int,int],float]=dict()
 
-                    bounds_x=(-10,10)
-                    bounds_y=(100,200)
+                    bounds_x=[]
+                    bounds_y=[]
+
                     last_min_on_boundary=False
                     num_iter=0
 
-                    while best_score>1.1:
+                    PADDING=12
+
+                    while True:
                         num_iter+=1
 
-                        if num_iter == 1:
-                            bounds_x=(-20,20)
-                            bounds_y=(100,200)
+                        # on odd iterations, scan a new coarse grid
+                        # (less coarse on later iterations)
+                        if num_iter%2==1:
+                            bounds_x=list(range(-300,300,(PADDING//num_iter) or 1))
+                            bounds_y=list(range(-300,300,(PADDING//num_iter) or 1))
 
-                        elif num_iter == 2:
-                            bounds_x=(-30,30)
-                            bounds_y=(-200,200)
-
+                        # on even iterations, refine the grid
+                        # (larger refine range on later iterations)
                         else:
-                            bounds_x=(int(bounds_x[0]*1.2),int(bounds_x[1]*1.2))
-                            bounds_y=(int(bounds_y[0]*1.1),int(bounds_y[1]*1.1))
+                            bounds_x=list(range(dx-int(PADDING*(num_iter-1)*1.5),dx+int(PADDING*(num_iter-1))))
+                            bounds_y=list(range(dy-int(PADDING*(num_iter-1)*1.5),dy+int(PADDING*(num_iter-1))))
 
                         new_score,dx,dy=estimate_offset2d(img1,img2,bounds_x=bounds_x,bounds_y=bounds_y,solutions=solutions)
 
                         print(f"local solution: score={new_score}, {dx=} {dy=}")
 
-                        if dx==bounds_x[0] or dx==bounds_x[1] or dy==bounds_y[0] or dy==bounds_y[1]:
-                            last_min_on_boundary=True
-                            # even if score has reached target, if the best score is reached on the boundary, force another iteration
-                        else:
-                            last_min_on_boundary=False
+                        # if we have just refined the local solution
+                        if num_iter%2==0:
+                            # if the new solution is better than the last local best, save it
+                            if new_score<best_score:
+                                best_score=new_score
 
-                        # if the score did not improve, even though we are not on the boundary
-                        # and have searched an interval large enough to assume a solution should have been found
-                        # -> then stop
-                        if new_score==best_score and num_iter>=3 and not last_min_on_boundary:
-                            break
+                                # stop after one refinement
+                                break
 
-                        best_score=new_score
+                            # if we have not found an optimal solution after several iterations, give up
+                            if num_iter>5:
+                                break
 
                     return best_score,dx,dy
 
@@ -207,11 +303,13 @@ def automatic_find_offsets(out_file_path:str="results.parquet"):
             while Path(out_file_path+f".{ending_num}.parquet").exists():
                 if len(out_file_path.split("."))>=2:
                     try:
-                        ending_num=int(list(out_file_path.split("."))[-2])
+                        existing_ending_num=int(list(out_file_path.split("."))[-2])
+                        if ending_num<existing_ending_num:
+                            ending_num=existing_ending_num
                     except:
                         pass
-                    finally:
-                        ending_num+=1
+
+                ending_num+=1
 
             out_file_path+=f".{ending_num}.parquet"
 
@@ -245,8 +343,8 @@ def interactive_offset2d(
     img_paths=sorted(img_paths,key=lambda p:get_acq_id(p))
 
     print(img_paths)
-    img1 = cv2.imread(img_paths[0], cv2.IMREAD_GRAYSCALE)
-    img2 = cv2.imread(img_paths[1], cv2.IMREAD_GRAYSCALE)
+    img1 = read_image(img_paths[0])
+    img2 = read_image(img_paths[1])
 
     IMG_SIZE_X=img1.shape[0]
     IMG_SIZE_Y=img1.shape[1]
@@ -294,6 +392,7 @@ def interactive_offset2d(
     reset_zoom = True  # Used to reset zoom when R is pressed
 
     def get_zoom_rect():
+        nonlocal zoom_rect
         if zoom_rect[2] is not None and zoom_rect[3] is not None:
             ret=[a for a in zoom_rect]
             ret[0], ret[1] = min(zoom_rect[0], zoom_rect[2]), min(zoom_rect[1], zoom_rect[3])
@@ -341,10 +440,10 @@ def interactive_offset2d(
 
     raw_display=None
     font_scale=1
-    score=None
+    score=1e9
 
     def on_trackbar_overlay(val):
-        global dx, dy
+        nonlocal dx, dy
 
         dx = cv2.getTrackbarPos('X Offset', WINDOW_HANDLE) + OFFSET_X_MIN
         dy = cv2.getTrackbarPos('Y Offset', WINDOW_HANDLE) + OFFSET_Y_MIN
@@ -356,6 +455,9 @@ def interactive_offset2d(
 
     def get_raw_display():
         nonlocal font_scale,dragging,zoom_rect,img1_rgb,aligned_rgb,colored_overlay,overlay_panel
+
+        if len([i for i in [img1_rgb,aligned_rgb,colored_overlay,overlay_panel] if i is None]):
+            return None
         
         # Apply zoom crop to all panels
         font_scale=4
@@ -382,22 +484,22 @@ def interactive_offset2d(
         return raw_display
 
     def calc_display():
-        nonlocal raw_display, font_scale, score, img1_rgb,aligned_rgb,colored_overlay,overlay_panel
+        nonlocal raw_display, font_scale, score, img1, img2, img1_rgb,aligned_rgb,colored_overlay,overlay_panel
 
-        aligned = np.roll(np.roll(img2, dx, axis=1), dy, axis=0)
-        aligned_outlined = add_outline(aligned)
-        score = calculate_score(img1, aligned)
+        img1_aligned,img2_aligned=crop_images(img1, img2, dx, dy)
+        score=calculate_score(img1_aligned,img2_aligned)
+        aligned_outlined = add_outline(img2_aligned)
 
         # Convert outlined images to RGB for consistent stacking
         img1_rgb = cv2.cvtColor(img1_outlined, cv2.COLOR_GRAY2BGR)
         aligned_rgb = cv2.cvtColor(aligned_outlined, cv2.COLOR_GRAY2BGR)
 
         # Create the monochrome difference overlay and apply a colormap
-        diff_overlay = calculate_monochrome_overlay(img1, aligned)
+        diff_overlay = calculate_monochrome_overlay(img1_aligned,img2_aligned)
         colored_overlay = cv2.applyColorMap(diff_overlay, cv2.COLORMAP_JET)
 
         # Create the direct overlay
-        overlay_panel = overlay_images(img1, aligned)
+        overlay_panel = overlay_images(img1_aligned,img2_aligned)
 
         # Resize all images to match the largest dimensions
         target_shape = img1_rgb.shape[:2]
@@ -412,7 +514,11 @@ def interactive_offset2d(
         """ colors in BGR format! """
         nonlocal dx,dy, font_scale, score
 
-        display=get_raw_display().copy()
+        display=get_raw_display()
+        if display is None:
+            return
+
+        display=display.copy()
 
         # Draw the rectangle indicator
         if dragging and zoom_rect[2] is not None and zoom_rect[3] is not None:
@@ -476,7 +582,7 @@ def interactive_offset2d(
 
 
 if __name__=="__main__":
-    if 1:
+    if not INTERACTIVE:
         automatic_find_offsets()
     else:
-        interactive_offset2d()
+        interactive_offset2d(0,"D10")
