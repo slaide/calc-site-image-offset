@@ -26,6 +26,7 @@ import glob
 import pandas as pd
 from dataclasses import dataclass, asdict
 from pathlib import Path
+import typing as tp
 
 from tqdm import tqdm
 
@@ -33,8 +34,10 @@ from concurrent.futures import ThreadPoolExecutor
 from itertools import product
 
 INTERACTIVE=False
-SCORE_MEANSQUAREERROR=True
+SCORE_MEANSQUAREERROR=False
 USE_GPU=False
+
+TEST_LOCAL=True
 
 if USE_GPU:
     if not SCORE_MEANSQUAREERROR:
@@ -59,6 +62,37 @@ else:
     import numpy as np
     DTYPE=np.uint8
 
+def get_paths(plate:str,well:str,site:int)->tp.List[str]:
+    # this path is from some test data
+    if TEST_LOCAL:
+        s=f"img_{plate}_acqid_*_{well}_site_1_merged.png"
+    
+    else:
+        s=f"/share/mikro2/squid/cp-duo/{plate}*/{well}_s{site}_*_Fluorescence_405_nm_Ex.tiff"
+    
+    g=glob.glob(s)
+    if TEST_LOCAL:
+        ret=g
+        print(ret)
+
+    else:
+        ret=[]
+        for f in g:
+            filename=Path(f).name
+            
+            #filename is WELL_sSITE_xSITEX_ySITEY[_zSITEZ]_CHANNEL.tiff
+            segments=filename[:-len("_Fluorescence_405_nm_Ex.tiff")].split("_")
+
+            # check for site z, and knowing that we are using a z=3 stack, if any
+            # use z==2 -> center of the stack
+            if len(segments)>4:
+                if segments[4][1]=="2":
+                    ret.append(f)
+            else:
+                ret.append(f)
+            
+    return ret
+
 def read_image(path:str)->np.array:
     ret=cv2.imread(path, cv2.IMREAD_GRAYSCALE)
 
@@ -80,28 +114,32 @@ def calculate_score(img1:cv2.Mat, img2:cv2.Mat)->float:
         return float(ret)
 
 def get_acq_id(p:str):
-    segments=p.split("_")
-    n=0
-    while True:
-        if segments[n]=="acqid":
+    if TEST_LOCAL:
+        segments=p.split("_")
+        n=0
+        while True:
+            if segments[n]=="acqid":
+                n+=1
+                break
+    
             n+=1
-            break
+    
+        return int(segments[n])
+    else:
+        ret=len(str(Path(p).parts[-2]))
 
-        n+=1
-
-    return int(segments[n])
+    return ret
 
 # Load an arbitrary file as grayscale
 plates=[
     "P101390",
     "P101389",
     "P106081",
-
-    #P106075
-    #P106070
-    #P106080
-    #P106074
-    #P106069
+    "P106075",
+    "P106070",
+    "P106080",
+    "P106074",
+    "P106069",
 ]
 
 def crop_images(img1, img2, x, y):
@@ -154,130 +192,139 @@ def automatic_find_offsets(out_file_path:str="results.parquet"):
         dy:int
         time_s:float
 
-    results:list[Result]=[]
+    def make_wellname(i:int)->str:
+        NUM_COLS=24
+        rowname=f"{chr(i//NUM_COLS+ord('A'))}"
+        colname=f"{(1+i%NUM_COLS):02}"
+        return rowname+colname
+
+    results:tp.List[Result]=[]
     try:
         for i in tqdm(range(len(plates))):
-            for well in tqdm("D10 A05 O22 A22 D22 O05".split(" ")):
-                start_time=time.time()
+            plate=plates[i]
+            for well in tqdm([make_wellname(i) for i in range(384)]):
+                for site in range(1,10):
+                    start_time=time.time()
+    
+                    img_paths=get_paths(plate=plate,well=well,site=site)
+                    #print(f"analyzing {plate=} {well=} {site=}, {img_paths=}")
+                    
+                    if len(img_paths)!=2:
+                        #print("skipping")
+                        continue
+                            
+                    img_paths=sorted(img_paths,key=lambda p:get_acq_id(p))
 
-                img_paths=glob.glob(f"/Users/pathe605/Downloads/img_{plates[i]}_acqid_*_{well}_site_1_merged.png")
-                if len(img_paths)!=2:
-                    print(f"skipping, because: len({img_paths})!=2")
-                    continue
-                        
-                img_paths=sorted(img_paths,key=lambda p:get_acq_id(p))
-
-                print(img_paths)
-                img1 = read_image(img_paths[0])
-                img2 = read_image(img_paths[1])
-
-                def calculate_offset2d(img1,img2):
-                    IMG_SIZE_X=img1.shape[0]
-                    IMG_SIZE_Y=img1.shape[1]
-
-                    def estimate_offset2d(
-                        img1,img2,
-                        bounds_x:tuple[int,int]|list[int],
-                        bounds_y:tuple[int,int]|list[int],
-
-                        solutions:dict[tuple[int,int],float]|None=None,
-                    ):
-                        """
-                        params:
-                            solutions: store scores in here to avoid re-calculating the score for a combination of offset parameters.
-                        """
-
-                        solutions=solutions or dict()
-
-                        def calculate_shifted_score(x,y):
-                            new_score=solutions.get((x,y))                        
-                                                
-                            if new_score is None:
-                                new_score=calculate_score(*crop_images(img1, img2, x, y))
-
-                                solutions[(x,y)]=new_score
-
-                        min_score=1e9
-                        min_x,min_y=0,0
-
-                        # Create the grid of all x, y combinations
-                        if type(bounds_x)==type((2,)):
-                            bounds_x=list(range(bounds_x[0],bounds_x[-1]+1))
-                        if type(bounds_y)==type((2,)):
-                            bounds_y=list(range(bounds_y[0],bounds_y[-1]+1))
-
-                        grid = list(product(bounds_x, bounds_y))
-
-                        # calculate results in parallel, using tqdm(executor.map()) for a dynamic progress bar
-                        # and list(tqdm()) to force tqdm to iterate over the results
-                        with ThreadPoolExecutor(max_workers=1) as executor:
-                            list(tqdm(executor.map(lambda args: calculate_shifted_score(*args), grid),total=len(grid)))
-
-                        for x in bounds_x:
-                            for y in bounds_y:
-                                new_score=solutions.get((x,y))
-                                assert new_score is not None, f"score for {(x,y)=} is None"
-
-                                if new_score<min_score:
-                                    min_score=new_score
-                                    min_x,min_y=x,y
-
-                        return min_score,min_x,min_y
-
-                    dx=0
-                    dy=0
-                    best_score=1e9 # some arbitrary large number
-                    last_score=best_score-1
-
-                    solutions:dict[tuple[int,int],float]=dict()
-
-                    bounds_x=[]
-                    bounds_y=[]
-
-                    last_min_on_boundary=False
-                    num_iter=0
-
-                    PADDING=12
-
-                    while True:
-                        num_iter+=1
-
-                        # on odd iterations, scan a new coarse grid
-                        # (less coarse on later iterations)
-                        if num_iter%2==1:
-                            bounds_x=list(range(-300,300,(PADDING//num_iter) or 1))
-                            bounds_y=list(range(-300,300,(PADDING//num_iter) or 1))
-
-                        # on even iterations, refine the grid
-                        # (larger refine range on later iterations)
-                        else:
-                            bounds_x=list(range(dx-int(PADDING*(num_iter-1)*1.5),dx+int(PADDING*(num_iter-1))))
-                            bounds_y=list(range(dy-int(PADDING*(num_iter-1)*1.5),dy+int(PADDING*(num_iter-1))))
-
-                        new_score,dx,dy=estimate_offset2d(img1,img2,bounds_x=bounds_x,bounds_y=bounds_y,solutions=solutions)
-
-                        print(f"local solution: score={new_score}, {dx=} {dy=}")
-
-                        # if we have just refined the local solution
-                        if num_iter%2==0:
-                            # if the new solution is better than the last local best, save it
-                            if new_score<best_score:
-                                best_score=new_score
-
-                                # stop after one refinement
-                                break
-
-                            # if we have not found an optimal solution after several iterations, give up
-                            if num_iter>5:
-                                break
-
-                    return best_score,dx,dy
-
-                best_score,dx,dy=calculate_offset2d(img1,img2)
-
-                print(f"min score: {best_score}, {dx=} {dy=} (plate {plates[i]}, {well=})")
-
-                results.append(Result(plate=plates[i],well=well,site=1,score=best_score,dx=dx,dy=dy,time_s=time.time()-start_time))
+                    img1 = read_image(img_paths[0])
+                    img2 = read_image(img_paths[1])
+    
+                    def calculate_offset2d(img1,img2):
+                        IMG_SIZE_X=img1.shape[0]
+                        IMG_SIZE_Y=img1.shape[1]
+    
+                        def estimate_offset2d(
+                            img1,img2,
+                            bounds_x:tp.Union[tp.Tuple[int,int],tp.List[int]],
+                            bounds_y:tp.Union[tp.Tuple[int,int],tp.List[int]],
+    
+                            solutions:tp.Optional[tp.Dict[tp.Tuple[int,int],float]]=None,
+                        ):
+                            """
+                            params:
+                                solutions: store scores in here to avoid re-calculating the score for a combination of offset parameters.
+                            """
+    
+                            solutions=solutions or dict()
+    
+                            def calculate_shifted_score(x,y):
+                                new_score=solutions.get((x,y))                        
+                                                    
+                                if new_score is None:
+                                    new_score=calculate_score(*crop_images(img1, img2, x, y))
+    
+                                    solutions[(x,y)]=new_score
+    
+                            min_score=1e9
+                            min_x,min_y=0,0
+    
+                            # Create the grid of all x, y combinations
+                            if type(bounds_x)==type((2,)):
+                                bounds_x=list(range(bounds_x[0],bounds_x[-1]+1))
+                            if type(bounds_y)==type((2,)):
+                                bounds_y=list(range(bounds_y[0],bounds_y[-1]+1))
+    
+                            grid = list(product(bounds_x, bounds_y))
+    
+                            # calculate results in parallel, using tqdm(executor.map()) for a dynamic progress bar
+                            # and list(tqdm()) to force tqdm to iterate over the results
+                            with ThreadPoolExecutor() as executor:
+                                list(tqdm(executor.map(lambda args: calculate_shifted_score(*args), grid),total=len(grid)))
+    
+                            for x in bounds_x:
+                                for y in bounds_y:
+                                    new_score=solutions.get((x,y))
+                                    assert new_score is not None, f"score for {(x,y)=} is None"
+    
+                                    if new_score<min_score:
+                                        min_score=new_score
+                                        min_x,min_y=x,y
+    
+                            return min_score,min_x,min_y
+    
+                        dx=0
+                        dy=0
+                        best_score=1e9 # some arbitrary large number
+                        last_score=best_score-1
+    
+                        solutions:dict[tp.Tuple[int,int],float]=dict()
+    
+                        bounds_x=[]
+                        bounds_y=[]
+    
+                        last_min_on_boundary=False
+                        num_iter=0
+    
+                        PADDING=12
+    
+                        while True:
+                            num_iter+=1
+    
+                            # on odd iterations, scan a new coarse grid
+                            # (less coarse on later iterations)
+                            if num_iter%2==1:
+                                bounds_x=list(range(-300,300,(PADDING//num_iter) or 1))
+                                bounds_y=list(range(-300,300,(PADDING//num_iter) or 1))
+    
+                            # on even iterations, refine the grid
+                            # (larger refine range on later iterations)
+                            else:
+                                bounds_x=list(range(dx-int(PADDING*(num_iter-1)*1.5),dx+int(PADDING*(num_iter-1))))
+                                bounds_y=list(range(dy-int(PADDING*(num_iter-1)*1.5),dy+int(PADDING*(num_iter-1))))
+    
+                            new_score,dx,dy=estimate_offset2d(img1,img2,bounds_x=bounds_x,bounds_y=bounds_y,solutions=solutions)
+    
+                            print(f"local solution: score={new_score}, {dx=} {dy=}")
+    
+                            # if we have just refined the local solution
+                            if num_iter%2==0:
+                                # if the new solution is better than the last local best, save it
+                                if new_score<best_score:
+                                    best_score=new_score
+    
+                                    # stop after one refinement
+                                    break
+    
+                                # if we have not found an optimal solution after several iterations, give up
+                                if num_iter>5:
+                                    break
+    
+                        return best_score,dx,dy
+    
+                    best_score,dx,dy=calculate_offset2d(img1,img2)
+    
+                    print(f"min score: {best_score}, {dx=} {dy=} (plate {plates[i]}, {well=})")
+    
+                    results.append(Result(plate=plates[i],well=well,site=1,score=best_score,dx=dx,dy=dy,time_s=time.time()-start_time))
 
     finally:
         res_df=pd.DataFrame.from_records([asdict(r) for r in results])
@@ -323,7 +370,7 @@ def interactive_offset2d(
     well=well_name
 
     print(f"checking {plates[i]} : {well=}")
-    img_paths=glob.glob(f"/Users/pathe605/Downloads/img_{plates[i]}_acqid_*_{well}_site_1_merged.png")
+    img_paths=get_paths(plate=plates[i],well=well)
     if len(img_paths)!=2:
         print(f"skipping, because: len({img_paths})!=2")
         raise RuntimeError()
@@ -360,7 +407,7 @@ def interactive_offset2d(
         diff_normalized = cv2.normalize(diff, None, 0, 255, cv2.NORM_MINMAX)
         return diff_normalized.astype(np.uint8)
 
-    def resize_to_match(image:cv2.Mat, target_shape:tuple[int,int])->cv2.Mat:
+    def resize_to_match(image:cv2.Mat, target_shape:tp.Tuple[int,int])->cv2.Mat:
         """Resize or pad the image to match the target shape."""
         target_h, target_w = target_shape
         h, w = image.shape[:2]
