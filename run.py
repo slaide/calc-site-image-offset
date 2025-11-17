@@ -1,3 +1,5 @@
+#!/usr/bin/env python3
+
 """
 calculate alignment values for fluorescence channels
 
@@ -20,6 +22,38 @@ select * from "results.parquet" limit 10 ;
 
 """
 
+import argparse
+
+def str_to_bool(value):
+    if value.lower() in {'true', '1', 'yes'}:
+        return True
+    elif value.lower() in {'false', '0', 'no'}:
+        return False
+    else:
+        raise argparse.ArgumentTypeError(f"Invalid boolean value: {value}")
+
+parser = argparse.ArgumentParser(description="Parse CLI arguments.")
+
+parser.add_argument("--interactive", type=str_to_bool, default=False, help="Set INTERACTIVE (bool).")
+parser.add_argument("-s","--score_meansquareerror", type=str_to_bool, default=False, help="Set SCORE_MEANSQUAREERROR (bool).")
+parser.add_argument("-g","--use_gpu", type=str_to_bool, default=False, help="Set USE_GPU (bool).")
+parser.add_argument("--test_local", type=str_to_bool, default=False, help="Set TEST_LOCAL (bool).")
+parser.add_argument("-i","--initial_plate_index", type=int, default=4, help="Set INITIAL_PLATE_INDEX (int).")
+
+args = parser.parse_args()
+
+INTERACTIVE = args.interactive
+SCORE_MEANSQUAREERROR = args.score_meansquareerror
+USE_GPU = args.use_gpu
+TEST_LOCAL = args.test_local
+INITIAL_PLATE_INDEX = args.initial_plate_index
+
+print(f"INTERACTIVE: {INTERACTIVE}")
+print(f"SCORE_MEANSQUAREERROR: {SCORE_MEANSQUAREERROR}")
+print(f"USE_GPU: {USE_GPU}")
+print(f"TEST_LOCAL: {TEST_LOCAL}")
+print(f"INITIAL_PLATE_INDEX: {INITIAL_PLATE_INDEX}")
+
 import cv2
 import time
 import glob
@@ -32,12 +66,7 @@ from tqdm import tqdm
 
 from concurrent.futures import ThreadPoolExecutor
 from itertools import product
-
-INTERACTIVE=False
-SCORE_MEANSQUAREERROR=False
-USE_GPU=False
-
-TEST_LOCAL=True
+import asyncio
 
 if USE_GPU:
     if not SCORE_MEANSQUAREERROR:
@@ -73,7 +102,6 @@ def get_paths(plate:str,well:str,site:int)->tp.List[str]:
     g=glob.glob(s)
     if TEST_LOCAL:
         ret=g
-        print(ret)
 
     else:
         ret=[]
@@ -181,7 +209,13 @@ def crop_images(img1, img2, x, y):
 
     return img1_cropped, img2_cropped
 
-def automatic_find_offsets(out_file_path:str="results.parquet"):
+async def automatic_find_offsets(out_file_path:str="results.parquet"):
+    def make_wellname(i:int)->str:
+        NUM_COLS=24
+        rowname=f"{chr(i//NUM_COLS+ord('A'))}"
+        colname=f"{(1+i%NUM_COLS):02}"
+        return rowname+colname
+
     @dataclass
     class Result:
         plate:str
@@ -192,11 +226,32 @@ def automatic_find_offsets(out_file_path:str="results.parquet"):
         dy:int
         time_s:float
 
-    def make_wellname(i:int)->str:
-        NUM_COLS=24
-        rowname=f"{chr(i//NUM_COLS+ord('A'))}"
-        colname=f"{(1+i%NUM_COLS):02}"
-        return rowname+colname
+    @dataclass
+    class Input:
+        plate:str
+        well:str
+        site:int
+        paths:tp.List[str]
+        img1:np.ndarray
+        img2:np.ndarray
+
+    async def asyncrun(f,*args,**kwargs):
+        return await asyncio.to_thread(f,*args,**kwargs)
+
+    def read_inputs(plate:str,well:str,site:int)->tp.Optional[Input]:
+        start_time=time.time()
+
+        img_paths=get_paths(plate=plate,well=well,site=site)
+        
+        if len(img_paths)!=2:
+            return None
+                
+        img_paths=sorted(img_paths,key=lambda p:get_acq_id(p))
+
+        img1 = read_image(img_paths[0])
+        img2 = read_image(img_paths[1])
+
+        return Input(plate,well,site,paths=img_paths,img1=img1,img2=img2)
 
     results:tp.List[Result]=[]
     try:
@@ -206,23 +261,19 @@ def automatic_find_offsets(out_file_path:str="results.parquet"):
                 for site in range(1,10):
                     start_time=time.time()
     
-                    img_paths=get_paths(plate=plate,well=well,site=site)
-                    #print(f"analyzing {plate=} {well=} {site=}, {img_paths=}")
-                    
-                    if len(img_paths)!=2:
-                        #print("skipping")
+                    inputs=await asyncrun(read_inputs,plate,well,site)
+                    if inputs is None:
                         continue
-                            
-                    img_paths=sorted(img_paths,key=lambda p:get_acq_id(p))
 
-                    img1 = read_image(img_paths[0])
-                    img2 = read_image(img_paths[1])
+                    img_paths=inputs.paths
+                    img1 = inputs.img1
+                    img2 = inputs.img2
     
                     def calculate_offset2d(img1,img2):
                         IMG_SIZE_X=img1.shape[0]
                         IMG_SIZE_Y=img1.shape[1]
     
-                        def estimate_offset2d(
+                        def estimate_offset_within_bounds(
                             img1,img2,
                             bounds_x:tp.Union[tp.Tuple[int,int],tp.List[int]],
                             bounds_y:tp.Union[tp.Tuple[int,int],tp.List[int]],
@@ -301,7 +352,7 @@ def automatic_find_offsets(out_file_path:str="results.parquet"):
                                 bounds_x=list(range(dx-int(PADDING*(num_iter-1)*1.5),dx+int(PADDING*(num_iter-1))))
                                 bounds_y=list(range(dy-int(PADDING*(num_iter-1)*1.5),dy+int(PADDING*(num_iter-1))))
     
-                            new_score,dx,dy=estimate_offset2d(img1,img2,bounds_x=bounds_x,bounds_y=bounds_y,solutions=solutions)
+                            new_score,dx,dy = estimate_offset_within_bounds( img1, img2, bounds_x = bounds_x, bounds_y = bounds_y, solutions = solutions)
     
                             print(f"local solution: score={new_score}, {dx=} {dy=}")
     
@@ -317,9 +368,9 @@ def automatic_find_offsets(out_file_path:str="results.parquet"):
                                 # if we have not found an optimal solution after several iterations, give up
                                 if num_iter>5:
                                     break
-    
+
                         return best_score,dx,dy
-    
+
                     best_score,dx,dy=calculate_offset2d(img1,img2)
     
                     print(f"min score: {best_score}, {dx=} {dy=} (plate {plates[i]}, {well=})")
@@ -618,6 +669,6 @@ def interactive_offset2d(
 
 if __name__=="__main__":
     if not INTERACTIVE:
-        automatic_find_offsets()
+        asyncio.run(automatic_find_offsets())
     else:
         interactive_offset2d(0,"D10")
